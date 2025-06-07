@@ -6,35 +6,62 @@ import { useState, useRef, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Target, Camera, Upload, RotateCcw, AlertTriangle, ThumbsUp, ThumbsDown, Video } from "lucide-react"
+import { Camera, Upload, RotateCcw, AlertTriangle, Video, StopCircle } from "lucide-react"
+import io from "socket.io-client"
 
-// API配置
+// 常數定義
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000"
+const ANALYSIS_DURATION = 10000 // 10秒
 
-export default function Component() {
-  const [predict, setPredict] = useState<string | null>(null)
-  const [streamUrl, setStreamUrl] = useState<string | null>(null)
-  const [uploading, setUploading] = useState(false)
+// 類型定義
+interface AnalysisData {
+  stride_angle: { score: number; status: string }
+  throwing_angle: { score: number; status: string }
+  arm_symmetry: { score: number; status: string }
+  hip_rotation: { score: number; status: string }
+  elbow_height: { score: number; status: string }
+}
+
+interface AnalysisRecord {
+  timestamp: string
+  score: number
+  predict: string | null
+}
+
+export default function BaseballDashboard() {
+  // 狀態管理
   const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [isCameraActive, setIsCameraActive] = useState(false)
+  const [uploading, setUploading] = useState(false)
+
+  // 分析數據
   const [currentScore, setCurrentScore] = useState(0)
-  const [analysisData, setAnalysisData] = useState({
+  const [predict, setPredict] = useState<string | null>(null)
+  const [analysisData, setAnalysisData] = useState<AnalysisData>({
     stride_angle: { score: 0, status: "" },
     throwing_angle: { score: 0, status: "" },
     arm_symmetry: { score: 0, status: "" },
     hip_rotation: { score: 0, status: "" },
     elbow_height: { score: 0, status: "" },
   })
-  const [analysisCount, setAnalysisCount] = useState(0)
-  const [bestMetric, setBestMetric] = useState({ name: "", score: 0 })
-  const [recentAnalyses, setRecentAnalyses] = useState<any[]>([])
-  const [averageScore, setAverageScore] = useState(0)
-  const [recommendations, setRecommendations] = useState<any[]>([])
-  const [hasAnalyzed, setHasAnalyzed] = useState(false)
 
+  // 統計數據
+  const [analysisCount, setAnalysisCount] = useState(0)
+  const [averageScore, setAverageScore] = useState(0)
+  const [bestMetric, setBestMetric] = useState({ name: "", score: 0 })
+  const [recentAnalyses, setRecentAnalyses] = useState<AnalysisRecord[]>([])
+  const [recommendations, setRecommendations] = useState<any[]>([])
+
+  // 媒體相關
+  const [streamUrl, setStreamUrl] = useState<string | null>(null)
+
+  // Refs
   const fileInputRef = useRef<HTMLInputElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const socketRef = useRef<any>(null)
 
-  // 獲取分析統計數據
+  // API 調用函數
   const fetchAnalyticsData = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/analytics`)
@@ -44,14 +71,12 @@ export default function Component() {
         setBestMetric(data.best_metric || { name: "", score: 0 })
         setAverageScore(data.average_score || 0)
         setRecommendations(data.recommendations || [])
-        setHasAnalyzed(data.has_analyzed || false)
       }
     } catch (error) {
       console.error("獲取分析數據失敗:", error)
     }
   }
 
-  // 獲取歷史記錄
   const fetchHistory = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/history`)
@@ -64,7 +89,6 @@ export default function Component() {
     }
   }
 
-  // 保存分析記錄
   const saveAnalysisRecord = async () => {
     try {
       const record = {
@@ -80,21 +104,81 @@ export default function Component() {
         body: JSON.stringify(record),
       })
 
-      setHasAnalyzed(true)
-      fetchHistory() // 重新獲取歷史記錄
-      fetchAnalyticsData() // 重新獲取統計數據
+      fetchHistory()
+      fetchAnalyticsData()
     } catch (error) {
       console.error("保存記錄失敗:", error)
     }
   }
 
-  // 處理影片上傳
-  const handleVideoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+  // WebSocket 連接管理
+  const initializeSocket = () => {
+    if (!socketRef.current) {
+      socketRef.current = io(API_BASE_URL)
 
+      socketRef.current.on("video_frame", (data: string) => {
+        setStreamUrl(`data:image/jpeg;base64,${data}`)
+      })
+
+      socketRef.current.on("analysis_data", (data: any) => {
+        setCurrentScore(data.overall_score || 0)
+        setAnalysisData(data.metrics || analysisData)
+        setPredict(data.predict || null)
+      })
+
+      socketRef.current.on("analysis_complete", () => {
+        setIsAnalyzing(false)
+        saveAnalysisRecord()
+      })
+    }
+  }
+
+  const disconnectSocket = () => {
+    if (socketRef.current) {
+      socketRef.current.disconnect()
+      socketRef.current = null
+    }
+  }
+
+  // 媒體處理函數
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+    setIsCameraActive(false)
+    setStreamUrl(null)
+  }
+
+  const startCameraStream = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      })
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        videoRef.current.play()
+        streamRef.current = stream
+        setIsCameraActive(true)
+
+        // 發送攝像機串流到後端
+        initializeSocket()
+        socketRef.current?.emit("start_camera_analysis")
+        setIsAnalyzing(true)
+      }
+    } catch (error) {
+      console.error("無法開啟攝像機:", error)
+      alert("無法開啟攝像機，請檢查權限設定")
+    }
+  }
+
+  const uploadVideoFile = async (file: File) => {
     setUploading(true)
-    setIsAnalyzing(true)
+    stopCamera()
 
     const formData = new FormData()
     formData.append("video", file)
@@ -107,71 +191,236 @@ export default function Component() {
 
       if (response.ok) {
         const data = await response.json()
-        // 開始分析處理
-        startAnalysis(data.session_id)
+
+        // 顯示上傳的影片
+        const videoUrl = URL.createObjectURL(file)
+        if (videoRef.current) {
+          videoRef.current.src = videoUrl
+          videoRef.current.load()
+        }
+
+        // 開始分析
+        initializeSocket()
+        socketRef.current?.emit("start_video_analysis", { session_id: data.session_id })
+        setIsAnalyzing(true)
       }
     } catch (error) {
       console.error("上傳失敗:", error)
+      alert("影片上傳失敗，請重試")
     } finally {
       setUploading(false)
     }
   }
 
-  // 開啟攝像機
-  const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        setIsAnalyzing(true)
-        startAnalysis()
-      }
-    } catch (error) {
-      console.error("無法開啟攝像機:", error)
+  // 事件處理函數
+  const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) {
+      uploadVideoFile(file)
     }
   }
 
-  // 開始分析
-  const startAnalysis = (sessionId?: string) => {
-    // 模擬分析過程
-    const interval = setInterval(() => {
-      setCurrentScore(Math.floor(Math.random() * 30) + 70)
-      setAnalysisData({
-        stride_angle: { score: Math.floor(Math.random() * 30) + 70, status: "良好" },
-        throwing_angle: { score: Math.floor(Math.random() * 30) + 70, status: "良好" },
-        arm_symmetry: { score: Math.floor(Math.random() * 30) + 70, status: "良好" },
-        hip_rotation: { score: Math.floor(Math.random() * 30) + 70, status: "良好" },
-        elbow_height: { score: Math.floor(Math.random() * 30) + 70, status: "良好" },
-      })
-      setPredict(Math.random() > 0.5 ? "好球" : "壞球")
-    }, 1000)
-
-    // 10秒後停止分析並保存記錄
-    setTimeout(() => {
-      clearInterval(interval)
-      setIsAnalyzing(false)
-      saveAnalysisRecord()
-    }, 10000)
+  const handleStartCamera = () => {
+    startCameraStream()
   }
 
-  // 重置
+  const handleStopCamera = () => {
+    stopCamera()
+    setIsAnalyzing(false)
+    disconnectSocket()
+  }
+
   const handleReset = () => {
+    stopCamera()
+    disconnectSocket()
     window.location.reload()
   }
 
-  // 獲取預測顯示
+  // 工具函數
   const getPredictDisplay = () => {
-    if (!predict) return { text: "預測中", color: "text-gray-600", icon: <Target className="h-4 w-4" /> }
-    if (predict === "好球")
-      return { text: "好球", color: "text-green-600", icon: <ThumbsUp className="h-5 w-5 text-green-600" /> }
-    return { text: "壞球", color: "text-red-600", icon: <ThumbsDown className="h-5 w-5 text-red-600" /> }
+    if (!predict) return { text: "等待分析", color: "text-gray-600" }
+    if (predict === "好球") return { text: "好球", color: "text-green-600" }
+    return { text: "壞球", color: "text-red-600" }
   }
 
-  const predictDisplay = getPredictDisplay()
+  const getMetricName = (key: string) => {
+    const names: Record<string, string> = {
+      stride_angle: "跨步角度",
+      throwing_angle: "投擲角度",
+      arm_symmetry: "雙手對稱性",
+      hip_rotation: "髖部旋轉角度",
+      elbow_height: "右手手肘高度",
+    }
+    return names[key] || key
+  }
 
+  const formatDateTime = (timestamp: string) => {
+    return new Date(timestamp).toLocaleString("zh-TW")
+  }
+
+  // 組件渲染函數
+  const renderVideoDisplay = () => (
+    <div className="aspect-video bg-gray-900 rounded-lg overflow-hidden">
+      {!isAnalyzing && !isCameraActive ? (
+        <div className="w-full h-full flex items-center justify-center">
+          <div className="text-center text-white space-y-4">
+            <Camera className="w-12 h-12 mx-auto opacity-50" />
+            <p className="text-sm opacity-75">選擇分析方式</p>
+            <div className="flex gap-3 justify-center">
+              <input type="file" accept="video/*" className="hidden" ref={fileInputRef} onChange={handleVideoUpload} />
+              <Button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="bg-gray-900 hover:bg-gray-800 text-white"
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                {uploading ? "上傳中..." : "上傳影片"}
+              </Button>
+              <Button onClick={handleStartCamera} className="bg-gray-900 hover:bg-gray-800 text-white">
+                <Video className="w-4 h-4 mr-2" />
+                開啟攝像機
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="relative w-full h-full">
+          <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+          {isCameraActive && (
+            <div className="absolute top-2 right-2">
+              <div className="flex items-center gap-2 bg-red-500 text-white px-2 py-1 rounded text-xs">
+                <div className="w-2 h-2 bg-white rounded-full animate-pulse"></div>
+                LIVE
+              </div>
+            </div>
+          )}
+          {streamUrl && (
+            <img
+              src={streamUrl || "/placeholder.svg"}
+              alt="骨架分析"
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+          )}
+        </div>
+      )}
+    </div>
+  )
+
+  const renderAnalysisResults = () => (
+    <div className="space-y-4">
+      <div className="text-center">
+        <div className="text-4xl font-bold text-blue-600">{currentScore}</div>
+        <p className="text-gray-600">整體姿勢評分</p>
+      </div>
+      <div className="space-y-3">
+        {Object.entries(analysisData).map(([key, data]) => (
+          <div key={key} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+            <span className="font-medium">{getMetricName(key)}</span>
+            <span className="font-bold">{data.score}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+
+  const renderMetricsCards = () => {
+    const predictDisplay = getPredictDisplay()
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">平均評分</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{averageScore}</div>
+            {averageScore === 0 && <p className="text-xs text-gray-500">尚無數據</p>}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">分析次數</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{analysisCount}</div>
+            {analysisCount === 0 && <p className="text-xs text-gray-500">尚無分析</p>}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">好壞球預測</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className={`text-2xl font-bold ${predictDisplay.color}`}>{predictDisplay.text}</div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">最佳項目</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{bestMetric.name || "無"}</div>
+            {!bestMetric.name && <p className="text-xs text-gray-500">尚無數據</p>}
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  const renderHistoryList = () => (
+    <div className="space-y-3">
+      {recentAnalyses.length > 0 ? (
+        recentAnalyses.map((analysis, index) => (
+          <div key={index} className="flex items-center justify-between p-3 border rounded-lg">
+            <div>
+              <p className="font-medium">{formatDateTime(analysis.timestamp)}</p>
+              <p className="text-sm text-gray-600">預測: {analysis.predict || "無"}</p>
+            </div>
+            <div className="text-lg font-bold">{analysis.score}</div>
+          </div>
+        ))
+      ) : (
+        <div className="text-center py-8">
+          <p className="text-gray-500">暫無分析記錄</p>
+          <p className="text-sm text-gray-400 mt-1">開始您的第一次分析</p>
+        </div>
+      )}
+    </div>
+  )
+
+  const renderRecommendations = () => (
+    <div>
+      {recommendations.length > 0 ? (
+        <div className="space-y-3">
+          {recommendations.map((rec, index) => (
+            <div key={index} className="p-3 bg-yellow-50 rounded border-l-4 border-yellow-400">
+              <h4 className="font-medium">{rec.title}</h4>
+              <p className="text-sm text-gray-600">{rec.description}</p>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-center py-8">
+          <AlertTriangle className="w-12 h-12 mx-auto text-gray-300 mb-3" />
+          <p className="text-gray-500">暫無改善建議</p>
+          <p className="text-sm text-gray-400 mt-1">完成分析後將顯示個人化建議</p>
+        </div>
+      )}
+    </div>
+  )
+
+  // 生命週期
   useEffect(() => {
     fetchAnalyticsData()
     fetchHistory()
+
+    return () => {
+      stopCamera()
+      disconnectSocket()
+    }
   }, [])
 
   return (
@@ -190,83 +439,26 @@ export default function Component() {
               <Camera className="w-5 h-5" />
               即時姿勢分析
             </CardTitle>
-            <CardDescription>選擇上傳影片或開啟攝像機進行分析</CardDescription>
+            <CardDescription>上傳影片或開啟攝像機進行MediaPipe骨架分析</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {/* Video Display */}
               <div className="relative">
-                <div className="aspect-video bg-gray-900 rounded-lg flex items-center justify-center">
-                  {!isAnalyzing ? (
-                    <div className="text-center text-white space-y-4">
-                      <Camera className="w-12 h-12 mx-auto opacity-50" />
-                      <p className="text-sm opacity-75">選擇分析方式</p>
-                      <div className="flex gap-3 justify-center">
-                        <input
-                          type="file"
-                          accept="video/*"
-                          className="hidden"
-                          ref={fileInputRef}
-                          onChange={handleVideoUpload}
-                        />
-                        <Button onClick={() => fileInputRef.current?.click()} disabled={uploading}>
-                          <Upload className="w-4 h-4 mr-2" />
-                          {uploading ? "上傳中..." : "上傳影片"}
-                        </Button>
-                        <Button onClick={startCamera} variant="outline">
-                          <Video className="w-4 h-4 mr-2" />
-                          開啟攝像機
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center">
-                      <video ref={videoRef} autoPlay className="w-full h-full rounded-lg object-contain" />
-                      {streamUrl && (
-                        <img
-                          src={streamUrl || "/placeholder.svg"}
-                          alt="分析畫面"
-                          className="w-full h-full object-contain"
-                        />
-                      )}
-                    </div>
+                {renderVideoDisplay()}
+                <div className="flex justify-center gap-2 mt-4">
+                  {isCameraActive && (
+                    <Button onClick={handleStopCamera} variant="destructive">
+                      <StopCircle className="w-4 h-4 mr-2" />
+                      停止攝像機
+                    </Button>
                   )}
-                </div>
-
-                <div className="flex justify-center mt-4">
                   <Button onClick={handleReset} variant="outline">
                     <RotateCcw className="w-4 h-4 mr-2" />
                     重置
                   </Button>
                 </div>
               </div>
-
-              {/* Analysis Results */}
-              <div className="space-y-4">
-                <div className="text-center">
-                  <div className="text-4xl font-bold text-blue-600">{currentScore}</div>
-                  <p className="text-gray-600">整體姿勢評分</p>
-                </div>
-
-                <div className="space-y-3">
-                  {Object.entries(analysisData).map(([key, data]) => (
-                    <div key={key} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                      <span className="font-medium">
-                        {key === "stride_angle"
-                          ? "跨步角度"
-                          : key === "throwing_angle"
-                            ? "投擲角度"
-                            : key === "arm_symmetry"
-                              ? "雙手對稱性"
-                              : key === "hip_rotation"
-                                ? "髖部旋轉角度"
-                                : "右手手肘高度"}
-                      </span>
-                      <span className="font-bold">{data.score}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              {renderAnalysisResults()}
             </div>
           </CardContent>
         </Card>
@@ -279,76 +471,14 @@ export default function Component() {
             <TabsTrigger value="recommendations">改善建議</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="metrics">
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">平均評分</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-2xl font-bold">{averageScore}</div>
-                  {averageScore === 0 && <p className="text-xs text-gray-500">尚無數據</p>}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">分析次數</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-2xl font-bold">{analysisCount}</div>
-                  {analysisCount === 0 && <p className="text-xs text-gray-500">尚無分析</p>}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">好壞球預測</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className={`text-2xl font-bold ${predictDisplay.color}`}>{predictDisplay.text}</div>
-                  {!predict && <p className="text-xs text-gray-500">等待分析</p>}
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">最佳項目</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="text-2xl font-bold">{bestMetric.name || "無"}</div>
-                  {!bestMetric.name && <p className="text-xs text-gray-500">尚無數據</p>}
-                  {bestMetric.score > 0 && <p className="text-xs text-gray-500">平均 {bestMetric.score} 分</p>}
-                </CardContent>
-              </Card>
-            </div>
-          </TabsContent>
+          <TabsContent value="metrics">{renderMetricsCards()}</TabsContent>
 
           <TabsContent value="history">
             <Card>
               <CardHeader>
                 <CardTitle>最近分析記錄</CardTitle>
               </CardHeader>
-              <CardContent>
-                <div className="space-y-3">
-                  {recentAnalyses.length > 0 ? (
-                    recentAnalyses.map((analysis, index) => (
-                      <div key={index} className="flex items-center justify-between p-3 border rounded-lg">
-                        <div>
-                          <p className="font-medium">{new Date(analysis.timestamp).toLocaleString("zh-TW")}</p>
-                          <p className="text-sm text-gray-600">預測: {analysis.predict || "無"}</p>
-                        </div>
-                        <div className="text-lg font-bold">{analysis.score}</div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="text-center py-8">
-                      <p className="text-gray-500">暫無分析記錄</p>
-                      <p className="text-sm text-gray-400 mt-1">開始您的第一次分析</p>
-                    </div>
-                  )}
-                </div>
-              </CardContent>
+              <CardContent>{renderHistoryList()}</CardContent>
             </Card>
           </TabsContent>
 
@@ -360,24 +490,7 @@ export default function Component() {
                   改善建議
                 </CardTitle>
               </CardHeader>
-              <CardContent>
-                {recommendations.length > 0 ? (
-                  <div className="space-y-3">
-                    {recommendations.map((rec, index) => (
-                      <div key={index} className="p-3 bg-yellow-50 rounded border-l-4 border-yellow-400">
-                        <h4 className="font-medium">{rec.title}</h4>
-                        <p className="text-sm text-gray-600">{rec.description}</p>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="text-center py-8">
-                    <AlertTriangle className="w-12 h-12 mx-auto text-gray-300 mb-3" />
-                    <p className="text-gray-500">暫無改善建議</p>
-                    <p className="text-sm text-gray-400 mt-1">完成分析後將顯示個人化建議</p>
-                  </div>
-                )}
-              </CardContent>
+              <CardContent>{renderRecommendations()}</CardContent>
             </Card>
           </TabsContent>
         </Tabs>
